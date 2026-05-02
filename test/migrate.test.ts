@@ -287,6 +287,17 @@ describe('migration v24 — rls_backfill_missing_tables', () => {
   test('LATEST_VERSION has caught up to 24', () => {
     expect(LATEST_VERSION).toBeGreaterThanOrEqual(24);
   });
+
+  // PGLite has no RLS engine and is intrinsically single-tenant. The 8 RLS
+  // backfill ALTER statements target tables that may not exist on PGLite
+  // (subagent_*, minion_inbox aren't always present in pglite-schema.ts).
+  // sqlFor.pglite='' makes v24 a no-op on PGLite while still bumping the
+  // version counter. Engine.kind discrimination in runMigrations selects
+  // sqlFor[engine.kind] over m.sql. Issue #395.
+  test('uses a PGLite no-op override so local brains skip Postgres-only RLS ALTER TABLEs', () => {
+    const v24 = MIGRATIONS.find(m => m.version === 24);
+    expect(v24?.sqlFor?.pglite).toBe('');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────
@@ -769,26 +780,35 @@ describe('PR #356 — apply-migrations pre-flight schema-version warning', () =>
   });
 });
 
-describe('PR #356 — setSessionDefaults is applied on both db.ts and postgres-engine.ts paths', () => {
-  test('structural: idle_in_transaction_session_timeout set via single helper', () => {
-    // After PR #356 extracted setSessionDefaults, both connect paths
-    // should call the helper, not inline the SET. Any regression
-    // that re-duplicates the block gets caught here.
+describe('PR #356 + #363 — session timeouts applied via startup parameters', () => {
+  test('structural: setSessionDefaults exists for back-compat; resolveSessionTimeouts is the source of truth', () => {
+    // PR #356 introduced setSessionDefaults (post-pool SET).
+    // PR #363 superseded it with resolveSessionTimeouts (startup parameters,
+    // PgBouncer-transaction-mode-safe). The setSessionDefaults function is
+    // kept as a no-op shim for back-compat with existing call sites.
     const dbSrc = readFileSync(resolve('src/core/db.ts'), 'utf-8');
     const pgSrc = readFileSync(resolve('src/core/postgres-engine.ts'), 'utf-8');
 
-    // Helper is defined in db.ts
+    // Helper still exists for back-compat
     expect(dbSrc).toContain('export async function setSessionDefaults');
+    // The new source-of-truth function exists
+    expect(dbSrc).toContain('export function resolveSessionTimeouts');
     expect(dbSrc).toContain('idle_in_transaction_session_timeout');
 
-    // connect() in db.ts calls the helper, doesn't inline the SET
-    // (the SET only appears inside the helper itself now).
-    const setMatches = dbSrc.match(/SET idle_in_transaction_session_timeout/g) || [];
-    expect(setMatches.length).toBe(1); // only in the helper
+    // Both connect paths call resolveSessionTimeouts() and feed it through
+    // postgres.js's connection option (startup parameters)
+    expect(dbSrc).toContain('resolveSessionTimeouts()');
+    expect(pgSrc).toContain('resolveSessionTimeouts()');
 
-    // postgres-engine.ts calls the helper too, doesn't duplicate
+    // setSessionDefaults still callable (no-op) so existing call sites
+    // don't break, but the SET command itself is gone — the work has
+    // already happened at connection startup time.
     expect(pgSrc).toContain('db.setSessionDefaults');
-    expect(pgSrc).not.toContain("SET idle_in_transaction_session_timeout");
+
+    // Critically: no SET idle_in_transaction in source — startup parameters
+    // are the durable mechanism for PgBouncer transaction mode.
+    const setMatches = dbSrc.match(/SET idle_in_transaction_session_timeout/g) || [];
+    expect(setMatches.length).toBe(0);
   });
 });
 
@@ -807,5 +827,151 @@ describe('PR #356 — non-transactional DDL runs via reserved connection', () =>
     const fnBody = source.slice(runFnIdx, runFnIdx + 2500);
     expect(fnBody).toContain('withReservedConnection');
     expect(fnBody).toContain("SET statement_timeout = '600000'");
+  });
+});
+
+describe('migration v31 — eval_capture_tables', () => {
+  test('exists with the expected name and is engine-specific (sqlFor)', () => {
+    const v31 = MIGRATIONS.find(m => m.version === 31);
+    expect(v31).toBeDefined();
+    expect(v31?.name).toBe('eval_capture_tables');
+    expect(v31?.sqlFor?.postgres).toBeDefined();
+    expect(v31?.sqlFor?.pglite).toBeDefined();
+    expect(v31?.sql).toBe('');
+  });
+
+  test('creates both eval_candidates and eval_capture_failures on both engines', () => {
+    const v31 = MIGRATIONS.find(m => m.version === 31)!;
+    for (const variant of ['postgres', 'pglite'] as const) {
+      const sql = v31.sqlFor![variant]!;
+      expect(sql).toContain('CREATE TABLE IF NOT EXISTS eval_candidates');
+      expect(sql).toContain('CREATE TABLE IF NOT EXISTS eval_capture_failures');
+    }
+  });
+
+  test('enforces CHECK length(query) <= 51200', () => {
+    const v31 = MIGRATIONS.find(m => m.version === 31)!;
+    for (const variant of ['postgres', 'pglite'] as const) {
+      expect(v31.sqlFor![variant]!).toContain('CHECK (length(query) <= 51200)');
+    }
+  });
+
+  test('enforces tool_name enum + reason enum', () => {
+    const v31 = MIGRATIONS.find(m => m.version === 31)!;
+    for (const variant of ['postgres', 'pglite'] as const) {
+      const sql = v31.sqlFor![variant]!;
+      expect(sql).toContain(`tool_name IN ('query', 'search')`);
+      expect(sql).toContain(`reason IN ('db_down', 'rls_reject', 'check_violation', 'scrubber_exception', 'other')`);
+    }
+  });
+
+  test('creates DESC indexes on both tables', () => {
+    const v31 = MIGRATIONS.find(m => m.version === 31)!;
+    for (const variant of ['postgres', 'pglite'] as const) {
+      const sql = v31.sqlFor![variant]!;
+      expect(sql).toContain('idx_eval_candidates_created_at');
+      expect(sql).toContain('idx_eval_capture_failures_ts');
+      expect(sql).toContain('created_at DESC');
+      expect(sql).toContain('ts DESC');
+    }
+  });
+
+  test('Postgres variant gates RLS on BYPASSRLS and fails loudly', () => {
+    const pgSql = MIGRATIONS.find(m => m.version === 31)!.sqlFor!.postgres!;
+    expect(pgSql).toContain('rolbypassrls');
+    expect(pgSql).toMatch(/IF NOT has_bypass/);
+    expect(pgSql).toMatch(/RAISE EXCEPTION[^;]*BYPASSRLS/);
+    expect(pgSql).toContain('ALTER TABLE eval_candidates ENABLE ROW LEVEL SECURITY');
+    expect(pgSql).toContain('ALTER TABLE eval_capture_failures ENABLE ROW LEVEL SECURITY');
+  });
+
+  test('PGLite variant has no RLS / no BYPASSRLS gate', () => {
+    const pgliteSql = MIGRATIONS.find(m => m.version === 31)!.sqlFor!.pglite!;
+    expect(pgliteSql).not.toContain('rolbypassrls');
+    expect(pgliteSql).not.toContain('ENABLE ROW LEVEL SECURITY');
+  });
+
+  test('LATEST_VERSION caught up to 31', () => {
+    expect(LATEST_VERSION).toBeGreaterThanOrEqual(31);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// PR #363 regression guards — session timeouts via startup parameters
+// resolveSessionTimeouts — GBRAIN_*_TIMEOUT env overrides
+// ─────────────────────────────────────────────────────────────────
+//
+// Guards: orphan pgbouncer backends that hold table locks for hours when
+// the postgres.js client disconnects mid-transaction. Session-level
+// statement_timeout + idle_in_transaction_session_timeout delivered as
+// startup parameters kill those backends on the server side.
+
+describe('resolveSessionTimeouts — env var overrides', () => {
+  const { resolveSessionTimeouts } = require('../src/core/db.ts');
+  const origStatement = process.env.GBRAIN_STATEMENT_TIMEOUT;
+  const origIdleTx = process.env.GBRAIN_IDLE_TX_TIMEOUT;
+  const origCheck = process.env.GBRAIN_CLIENT_CHECK_INTERVAL;
+
+  afterAll(() => {
+    const restore = (key: string, val: string | undefined) => {
+      if (val === undefined) delete process.env[key];
+      else process.env[key] = val;
+    };
+    restore('GBRAIN_STATEMENT_TIMEOUT', origStatement);
+    restore('GBRAIN_IDLE_TX_TIMEOUT', origIdleTx);
+    restore('GBRAIN_CLIENT_CHECK_INTERVAL', origCheck);
+  });
+
+  const resetEnv = () => {
+    delete process.env.GBRAIN_STATEMENT_TIMEOUT;
+    delete process.env.GBRAIN_IDLE_TX_TIMEOUT;
+    delete process.env.GBRAIN_CLIENT_CHECK_INTERVAL;
+  };
+
+  test('returns statement_timeout + idle_in_transaction defaults when unset', () => {
+    resetEnv();
+    const t = resolveSessionTimeouts();
+    expect(t.statement_timeout).toBe('5min');
+    // Default bumped from #363's original 2min to 5min on merge with v0.21.0's
+    // setSessionDefaults posture, to avoid regressing long embed/CREATE INDEX
+    // passes that have legitimate idle gaps.
+    expect(t.idle_in_transaction_session_timeout).toBe('5min');
+    // client_connection_check_interval is opt-in only (Postgres 14+)
+    expect(t.client_connection_check_interval).toBeUndefined();
+  });
+
+  test('env vars override the defaults', () => {
+    resetEnv();
+    process.env.GBRAIN_STATEMENT_TIMEOUT = '10min';
+    process.env.GBRAIN_IDLE_TX_TIMEOUT = '30s';
+    process.env.GBRAIN_CLIENT_CHECK_INTERVAL = '15s';
+    const t = resolveSessionTimeouts();
+    expect(t.statement_timeout).toBe('10min');
+    expect(t.idle_in_transaction_session_timeout).toBe('30s');
+    expect(t.client_connection_check_interval).toBe('15s');
+  });
+
+  test("'0' disables a specific GUC", () => {
+    resetEnv();
+    process.env.GBRAIN_STATEMENT_TIMEOUT = '0';
+    const t = resolveSessionTimeouts();
+    expect(t.statement_timeout).toBeUndefined();
+    expect(t.idle_in_transaction_session_timeout).toBe('5min');
+  });
+
+  test("'off' disables a specific GUC", () => {
+    resetEnv();
+    process.env.GBRAIN_IDLE_TX_TIMEOUT = 'off';
+    const t = resolveSessionTimeouts();
+    expect(t.statement_timeout).toBe('5min');
+    expect(t.idle_in_transaction_session_timeout).toBeUndefined();
+  });
+
+  test('all three can be disabled independently', () => {
+    resetEnv();
+    process.env.GBRAIN_STATEMENT_TIMEOUT = '0';
+    process.env.GBRAIN_IDLE_TX_TIMEOUT = 'off';
+    const t = resolveSessionTimeouts();
+    expect(Object.keys(t)).toHaveLength(0);
   });
 });
